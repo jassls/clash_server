@@ -39,6 +39,7 @@ MIHOMO_VERSION="${MIHOMO_VERSION:-}"
 SS_PORT="${SS_PORT:-8388}"
 MIXED_PORT="${MIXED_PORT:-7890}"
 API_PORT="${API_PORT:-9090}"
+SUB_PORT="${SUB_PORT:-9100}"
 CIPHER="${CIPHER:-aes-256-gcm}"
 
 BIN=/usr/local/bin/mihomo
@@ -100,12 +101,14 @@ fi
 : "${MIXED_USER:=verge}"
 : "${MIXED_PASS:=$(openssl rand -hex 12)}"
 : "${API_SECRET:=$(openssl rand -hex 16)}"
+: "${SUB_TOKEN:=$(openssl rand -hex 16)}"   # 订阅链接访问令牌：一旦生成不再随 --force 轮换，保证订阅 URL 长期有效
 
 cat > "$CREDS" <<CREDS_EOF
 SS_PASS='$SS_PASS'
 MIXED_USER='$MIXED_USER'
 MIXED_PASS='$MIXED_PASS'
 API_SECRET='$API_SECRET'
+SUB_TOKEN='$SUB_TOKEN'
 CREDS_EOF
 chmod 600 "$CREDS"
 
@@ -278,7 +281,8 @@ systemctl restart "$SVC"
 if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
   firewall-cmd --permanent \
     --add-port="$SS_PORT/tcp" --add-port="$SS_PORT/udp" \
-    --add-port="$MIXED_PORT/tcp" --add-port="$MIXED_PORT/udp" >/dev/null
+    --add-port="$MIXED_PORT/tcp" --add-port="$MIXED_PORT/udp" \
+    --add-port="$SUB_PORT/tcp" >/dev/null
   firewall-cmd --reload >/dev/null
   log "firewalld 已放行 $SS_PORT tcp/udp、$MIXED_PORT tcp/udp"
 else
@@ -314,6 +318,21 @@ if [[ "$http" == "204" ]]; then
   log "代理链路自检通过：经本机代理访问 generate_204 => 204"
 else
   warn "代理出网自检未通过 (HTTP $http)：确认本机可直接访问外网"
+fi
+
+# 订阅分发服务自检
+sleep 1
+if systemctl is-active --quiet mihomo-sub; then
+  subcode="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$SUB_PORT/$SUB_TOKEN" || true)"
+  badcode="$(curl -s -o /dev/null -w '%{http_code}' -m 5 "http://127.0.0.1:$SUB_PORT/wrong-token" || true)"
+  if [[ "$subcode" == "200" && "$badcode" == "404" ]]; then
+    log "订阅分发服务自检通过：正确 token 200 / 错误 token 404"
+  else
+    warn "订阅服务自检异常 (正确=$subcode 错误=$badcode)"
+  fi
+else
+  journalctl -u mihomo-sub -n 20 --no-pager || true
+  warn "mihomo-sub 服务未运行（订阅链接不可用，其余功能不受影响）"
 fi
 
 # ---------- 输出 Clash Verge 接入信息 ----------
@@ -353,6 +372,113 @@ ADDR_COMMENT="# 接入地址: $CLIENT_IP（公网出口: ${PUB_IP:-探测失败}
 
 SS_USERINFO="$(printf '%s:%s' "$CIPHER" "$SS_PASS" | openssl base64 -A | tr '+/' '-_' | tr -d '=')"
 SS_LINK="ss://${SS_USERINFO}@${CLIENT_IP}:${SS_PORT}#rocky-clash"
+SUB_URL="http://${CLIENT_IP}:${SUB_PORT}/${SUB_TOKEN}"
+
+# ---------- 订阅分发服务：完整订阅配置 + token 保护的小型 HTTP 服务（python3 标准库，零依赖）----------
+mkdir -p "$CONF_DIR/sub"
+cat > "$CONF_DIR/sub/config.yaml" <<SUB_CFG_EOF
+# Rocky 自建节点订阅 —— Clash Verge「配置 → 新建」直接粘贴订阅链接即可
+# 本文件由 install.sh 生成：服务器重跑安装脚本会同步更新；
+# --force 轮换凭据后无需改客户端订阅，客户端下次更新自动拿到新密码
+proxies:
+  - name: rocky-clash
+    type: ss
+    server: $CLIENT_IP
+    port: $SS_PORT
+    cipher: $CIPHER
+    password: "$SS_PASS"
+    udp: true
+  - name: rocky-mixed
+    type: socks5
+    server: $CLIENT_IP
+    port: $MIXED_PORT
+    username: $MIXED_USER
+    password: "$MIXED_PASS"
+    udp: true
+
+proxy-groups:
+  - name: "♻️ 手动切换"
+    type: select
+    proxies:
+      - rocky-clash
+      - rocky-mixed
+      - DIRECT
+
+rules:
+  - MATCH,♻️ 手动切换
+SUB_CFG_EOF
+
+cat > "$CONF_DIR/sub-server.py" <<'SUB_SRV_EOF'
+#!/usr/bin/env python3
+"""mihomo 订阅分发：仅精确匹配 /<SUB_TOKEN> 的 GET 返回订阅配置，其余一律 404。
+SUB_TOKEN/SUB_PORT 从环境变量读取（由 systemd EnvironmentFile 注入，不出现在命令行）。"""
+import http.server
+import os
+import socketserver
+import sys
+
+TOKEN = os.environ.get("SUB_TOKEN", "")
+PORT = int(os.environ.get("SUB_PORT", "9100"))
+CONFIG_FILE = os.environ.get("SUB_CONFIG_FILE", "/etc/mihomo/sub/config.yaml")
+
+if not TOKEN:
+    sys.exit("SUB_TOKEN 未设置")
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path.split("?")[0] != "/" + TOKEN:
+            self.send_error(404)
+            return
+        try:
+            with open(CONFIG_FILE, "rb") as f:
+                data = f.read()
+        except OSError:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", "text/yaml; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="clash-config.yaml"')
+        self.send_header("profile-update-interval", "24")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % args))
+
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+if __name__ == "__main__":
+    with Server(("0.0.0.0", PORT), Handler) as srv:
+        srv.serve_forever()
+SUB_SRV_EOF
+
+cat > /etc/systemd/system/mihomo-sub.service <<'SUB_UNIT_EOF'
+[Unit]
+Description=mihomo subscription distributor (token-protected)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=clash
+EnvironmentFile=/etc/mihomo/credentials.env
+ExecStart=/usr/bin/python3 /etc/mihomo/sub-server.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+SUB_UNIT_EOF
+
+chown clash:clash "$CONF_DIR/sub/config.yaml" "$CONF_DIR/sub-server.py"
+chmod 640 "$CONF_DIR/sub/config.yaml"
+chmod 750 "$CONF_DIR/sub-server.py"
+systemctl daemon-reload
+systemctl enable mihomo-sub >/dev/null 2>&1
+systemctl restart mihomo-sub
+log "订阅分发服务已启动 (端口 $SUB_PORT)"
 
 cat > "$CONF_DIR/clash-verge-client.yaml" <<CLIENT_EOF
 # ============================================================
@@ -369,6 +495,7 @@ cat > "$CONF_DIR/clash-verge-client.yaml" <<CLIENT_EOF
 # prepend-proxy-groups / prepend-rules 的值贴进去（注意加 prepend- 前缀）。
 # ============================================================
 ss-link: "$SS_LINK"
+subscription: "$SUB_URL"
 
 proxies:
   - name: rocky-clash
@@ -412,9 +539,11 @@ echo "--------------------------------------------------"
 echo " Shadowsocks 入口 : $CLIENT_IP:$SS_PORT ($CIPHER)"
 echo " mixed 入口       : $CLIENT_IP:$MIXED_PORT (账号 $MIXED_USER)"
 [[ -n "$IP_NOTE" ]] && echo " 地址说明 : $IP_NOTE"
-echo " 安全组提醒 : 云主机请在平台安全组放行 $SS_PORT/tcp+udp、$MIXED_PORT/tcp（与本机 firewalld 无关）"
+echo " 安全组提醒 : 云主机请在平台安全组放行 $SS_PORT/tcp+udp、$MIXED_PORT/tcp、$SUB_PORT/tcp（与本机 firewalld 无关）"
 echo " Verge 导入链接   :"
 echo "   $SS_LINK"
+echo " 订阅链接(推荐)   : $SUB_URL"
+echo "   Verge → 配置 → 新建 → 粘贴此链接；链接含凭据，勿外传"
 echo " 客户端配置片段   : $CONF_DIR/clash-verge-client.yaml"
 echo "=================================================="
 echo
